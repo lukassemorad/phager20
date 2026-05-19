@@ -33,8 +33,8 @@ export class GameScene extends Phaser.Scene {
 
   // Drag
   private isDragging = false;
-  private dragWorldX = 0;
-  private dragWorldY = 0;
+  private prevDragX = 0;
+  private prevDragY = 0;
 
   // Pinch
   private isPinching = false;
@@ -66,6 +66,8 @@ export class GameScene extends Phaser.Scene {
     this.isPinching = false;
     this.tapMoved = false;
     this.wasPinching = false;
+    this.prevDragX = 0;
+    this.prevDragY = 0;
     this.lastGenTime = 0;
     this.lastEnemyTime = 0;
 
@@ -78,7 +80,6 @@ export class GameScene extends Phaser.Scene {
 
   update(time: number, delta: number): void {
     if (this.isPinching) this.tickPinch();
-    this.applyScrollBounds();
     if (this.gameOver) return;
 
     if (time - this.lastGenTime >= UNIT_GEN_INTERVAL_MS) {
@@ -166,53 +167,36 @@ export class GameScene extends Phaser.Scene {
 
   private setupCamera(): void {
     const cam = this.cameras.main;
-    // No setBounds — Phaser pins scroll to the bound origin when the viewport
-    // is larger than the world, which makes getWorldPoint() return wrong coords.
-    // We enforce bounds manually via applyScrollBounds().
-    // Use window dimensions as fallback: Scale.RESIZE may report 0x0 during create()
-    // if the parent element hasn't been laid out yet.
-    const w = this.scale.width || window.innerWidth;
-    const h = this.scale.height || window.innerHeight;
-    const minZoom = this.calcMinZoom(w, h);
-    cam.setZoom(minZoom);
-    cam.setScroll(
-      WORLD_WIDTH / 2 - w / (2 * minZoom),
-      WORLD_HEIGHT / 2 - h / (2 * minZoom),
-    );
+    cam.setZoom(this.calcMinZoom(cam.width, cam.height));
+    cam.centerOn(WORLD_WIDTH / 2, WORLD_HEIGHT / 2);
 
-    this.scale.on('resize', () => {
-      const newMin = this.calcMinZoom(cam.width, cam.height);
+    this.scale.on('resize', (gameSize: Phaser.Structs.Size) => {
+      const newMin = this.calcMinZoom(gameSize.width, gameSize.height);
       if (cam.zoom < newMin) cam.setZoom(newMin);
-      this.applyScrollBounds();
+      this.clampScroll();
     });
   }
 
-  // Keeps the camera within world+padding. When the viewport is larger than the
-  // world in either axis, the world is centred on that axis (no panning possible).
-  // When smaller, scroll is clamped to the valid range.
-  // Uses cam.getWorldPoint() so the measurement is always consistent with how
-  // Phaser maps screen→world coordinates internally.
-  private applyScrollBounds(): void {
+  // Centres the world when the viewport is larger; clamps scroll otherwise.
+  // In Phaser 3.60+, cam.scrollX = worldX_at_screenCenter - cam.width/2, so all
+  // bounds are offset by ±cam.width/2 compared to the old "top-left" convention.
+  private clampScroll(): void {
     const cam = this.cameras.main;
-    const tl = cam.getWorldPoint(0, 0);
-    const br = cam.getWorldPoint(cam.width, cam.height);
-    const vw = br.x - tl.x;
-    const vh = br.y - tl.y;
-
+    const vw = cam.width / cam.zoom;
+    const vh = cam.height / cam.zoom;
     const bx = -WORLD_PADDING;
     const by = -WORLD_PADDING;
     const bw = WORLD_WIDTH + 2 * WORLD_PADDING;
     const bh = WORLD_HEIGHT + 2 * WORLD_PADDING;
+    const hw = cam.width / 2;
+    const hh = cam.height / 2;
 
-    const scrollX = vw >= bw
-      ? bx + (bw - vw) / 2
-      : Phaser.Math.Clamp(tl.x, bx, bx + bw - vw);
-
-    const scrollY = vh >= bh
-      ? by + (bh - vh) / 2
-      : Phaser.Math.Clamp(tl.y, by, by + bh - vh);
-
-    cam.setScroll(scrollX, scrollY);
+    cam.scrollX = vw >= bw
+      ? bx + bw / 2 - hw
+      : Phaser.Math.Clamp(cam.scrollX, bx + vw / 2 - hw, bx + bw - vw / 2 - hw);
+    cam.scrollY = vh >= bh
+      ? by + bh / 2 - hh
+      : Phaser.Math.Clamp(cam.scrollY, by + vh / 2 - hh, by + bh - vh / 2 - hh);
   }
 
   private calcMinZoom(w: number, h: number): number {
@@ -236,13 +220,13 @@ export class GameScene extends Phaser.Scene {
     this.input.on(
       'wheel',
       (ptr: Phaser.Input.Pointer, _: Phaser.GameObjects.GameObject[], __: number, dy: number) => {
-        const worldPt = cam.getWorldPoint(ptr.x, ptr.y);
+        const wp = cam.getWorldPoint(ptr.x, ptr.y);
         const newZoom = this.clampZoom(cam.zoom * Math.pow(0.999, dy));
         cam.setZoom(newZoom);
-        cam.setScroll(
-          worldPt.x - ptr.x / newZoom,
-          worldPt.y - ptr.y / newZoom,
-        );
+        // scrollX = worldX_at_screenCenter − cam.width/2, so to keep wp.x under ptr.x:
+        cam.scrollX = wp.x - cam.width / 2 - (ptr.x - cam.width / 2) / newZoom;
+        cam.scrollY = wp.y - cam.height / 2 - (ptr.y - cam.height / 2) / newZoom;
+        this.clampScroll();
       },
     );
 
@@ -255,19 +239,16 @@ export class GameScene extends Phaser.Scene {
       }
       if (this.isPinching) return;
 
-      // Record tap origin for tap-vs-drag detection
       this.tapDownX = ptr.x;
       this.tapDownY = ptr.y;
       this.tapMoved = false;
       this.wasPinching = false;
-
-      const wp = cam.getWorldPoint(ptr.x, ptr.y);
-      this.dragWorldX = wp.x;
-      this.dragWorldY = wp.y;
+      this.prevDragX = ptr.x;
+      this.prevDragY = ptr.y;
       this.isDragging = true;
     });
 
-    // Pointer move: pan + mark tap as moved if threshold exceeded
+    // Pointer move: delta-based pan + tap-move detection
     this.input.on(Phaser.Input.Events.POINTER_MOVE, (ptr: Phaser.Input.Pointer) => {
       if (
         Phaser.Math.Distance.Between(ptr.x, ptr.y, this.tapDownX, this.tapDownY) >
@@ -276,10 +257,11 @@ export class GameScene extends Phaser.Scene {
         this.tapMoved = true;
       }
       if (this.isPinching || !this.isDragging || !ptr.isDown) return;
-      cam.setScroll(
-        this.dragWorldX - ptr.x / cam.zoom,
-        this.dragWorldY - ptr.y / cam.zoom,
-      );
+      cam.scrollX -= (ptr.x - this.prevDragX) / cam.zoom;
+      cam.scrollY -= (ptr.y - this.prevDragY) / cam.zoom;
+      this.clampScroll();
+      this.prevDragX = ptr.x;
+      this.prevDragY = ptr.y;
     });
 
     // Pointer up: stop gestures; fire tap if pointer barely moved
@@ -297,13 +279,12 @@ export class GameScene extends Phaser.Scene {
         return;
       }
 
-      // One finger still down after pinch: seamlessly continue as drag
+      // One finger still down after pinch: continue as drag
       if (this.isPinching) {
         this.isPinching = false;
         const active = p1.isDown ? p1 : p2;
-        const wp = cam.getWorldPoint(active.x, active.y);
-        this.dragWorldX = wp.x;
-        this.dragWorldY = wp.y;
+        this.prevDragX = active.x;
+        this.prevDragY = active.y;
         this.isDragging = true;
       }
     });
@@ -330,10 +311,8 @@ export class GameScene extends Phaser.Scene {
       this.isPinching = false;
       const active = p1.isDown ? p1 : p2;
       if (active.isDown) {
-        const cam = this.cameras.main;
-        const wp = cam.getWorldPoint(active.x, active.y);
-        this.dragWorldX = wp.x;
-        this.dragWorldY = wp.y;
+        this.prevDragX = active.x;
+        this.prevDragY = active.y;
         this.isDragging = true;
       }
       return;
@@ -344,13 +323,13 @@ export class GameScene extends Phaser.Scene {
     const midY = (p1.y + p2.y) / 2;
     const dist = Math.max(1, Phaser.Math.Distance.Between(p1.x, p1.y, p2.x, p2.y));
 
-    const worldPt = cam.getWorldPoint(this.prevMidX, this.prevMidY);
+    // Zoom toward previous midpoint, then pan by midpoint delta
+    const wp = cam.getWorldPoint(this.prevMidX, this.prevMidY);
     const newZoom = this.clampZoom(cam.zoom * (dist / this.prevPinchDist));
     cam.setZoom(newZoom);
-    cam.setScroll(
-      worldPt.x - midX / newZoom,
-      worldPt.y - midY / newZoom,
-    );
+    cam.scrollX = wp.x - cam.width / 2 - (midX - cam.width / 2) / newZoom;
+    cam.scrollY = wp.y - cam.height / 2 - (midY - cam.height / 2) / newZoom;
+    this.clampScroll();
 
     this.prevMidX = midX;
     this.prevMidY = midY;
